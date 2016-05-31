@@ -642,10 +642,16 @@ var BufferController = function (_EventHandler) {
   function BufferController(hls) {
     _classCallCheck(this, BufferController);
 
+    // the value that we have set mediasource.duration to
+    // (the actual duration may be tweaked slighly by the browser)
+
+    var _this = _possibleConstructorReturn(this, Object.getPrototypeOf(BufferController).call(this, hls, _events2.default.MEDIA_ATTACHING, _events2.default.MEDIA_DETACHING, _events2.default.BUFFER_RESET, _events2.default.BUFFER_APPENDING, _events2.default.BUFFER_CODECS, _events2.default.BUFFER_EOS, _events2.default.BUFFER_FLUSHING, _events2.default.LEVEL_UPDATED));
+
+    _this._msDuration = null;
+    // the value that we want to set mediaSource.duration to
+    _this._levelDuration = null;
+
     // Source Buffer listeners
-
-    var _this = _possibleConstructorReturn(this, Object.getPrototypeOf(BufferController).call(this, hls, _events2.default.MEDIA_ATTACHING, _events2.default.MEDIA_DETACHING, _events2.default.BUFFER_RESET, _events2.default.BUFFER_APPENDING, _events2.default.BUFFER_CODECS, _events2.default.BUFFER_EOS, _events2.default.BUFFER_FLUSHING));
-
     _this.onsbue = _this.onSBUpdateEnd.bind(_this);
     _this.onsbe = _this.onSBUpdateError.bind(_this);
     return _this;
@@ -746,6 +752,8 @@ var BufferController = function (_EventHandler) {
       if (this._needsEos) {
         this.onBufferEos();
       }
+
+      this.updateMediaElementDuration();
 
       this.hls.trigger(_events2.default.BUFFER_APPENDED);
 
@@ -851,6 +859,48 @@ var BufferController = function (_EventHandler) {
       // attempt flush immediatly
       this.flushBufferCounter = 0;
       this.doFlush();
+    }
+  }, {
+    key: 'onLevelUpdated',
+    value: function onLevelUpdated(event) {
+      var details = event.details;
+      if (details.fragments.length === 0) {
+        return;
+      }
+      this._levelDuration = details.totalduration + details.fragments[0].start;
+      this.updateMediaElementDuration();
+    }
+
+    // https://github.com/dailymotion/hls.js/issues/355
+
+  }, {
+    key: 'updateMediaElementDuration',
+    value: function updateMediaElementDuration() {
+      if (this._levelDuration === null) {
+        return;
+      }
+      var media = this.media;
+      var mediaSource = this.mediaSource;
+      if (!media || !mediaSource || media.readyState === 0 || mediaSource.readyState !== 'open') {
+        return;
+      }
+      for (var type in mediaSource.sourceBuffers) {
+        if (mediaSource.sourceBuffers[type].updating) {
+          // can't set duration whilst a buffer is updating
+          return;
+        }
+      }
+      if (this._msDuration === null) {
+        // initialise to the value that the media source is reporting
+        this._msDuration = mediaSource.duration;
+      }
+      // this._levelDuration was the last value we set.
+      // not using mediaSource.duration as the browser may tweak this value
+      if (this._levelDuration !== this._msDuration) {
+        _logger.logger.log('Updating mediasource duration to ' + this._levelDuration);
+        mediaSource.duration = this._levelDuration;
+        this._msDuration = this._levelDuration;
+      }
     }
   }, {
     key: 'doFlush',
@@ -1463,8 +1513,9 @@ var LevelController = function (_EventHandler) {
 
       var details = data.details,
           hls = this.hls,
-          levelId,
-          level;
+          levelId = void 0,
+          level = void 0,
+          levelError = false;
       // try to recover not fatal errors
       switch (details) {
         case _errors.ErrorDetails.FRAG_LOAD_ERROR:
@@ -1477,6 +1528,7 @@ var LevelController = function (_EventHandler) {
         case _errors.ErrorDetails.LEVEL_LOAD_ERROR:
         case _errors.ErrorDetails.LEVEL_LOAD_TIMEOUT:
           levelId = data.level;
+          levelError = true;
           break;
         default:
           break;
@@ -1500,6 +1552,10 @@ var LevelController = function (_EventHandler) {
             hls.abrController.nextAutoLevel = 0;
           } else if (level && level.details && level.details.live) {
             _logger.logger.warn('level controller,' + details + ' on live stream, discard');
+            if (levelError) {
+              // reset this._level so that another call to set level() will retrigger a frag load
+              this._level = undefined;
+            }
             // FRAG_LOAD_ERROR and FRAG_LOAD_TIMEOUT are handled by mediaController
           } else if (details !== _errors.ErrorDetails.FRAG_LOAD_ERROR && details !== _errors.ErrorDetails.FRAG_LOAD_TIMEOUT) {
               _logger.logger.error('cannot recover ' + details + ' error');
@@ -2043,9 +2099,10 @@ var StreamController = function (_EventHandler) {
           //logger.log(`level/sn/start/end/bufEnd:${level}/${candidate.sn}/${candidate.start}/${(candidate.start+candidate.duration)}/${bufferEnd}`);
           if (candidate.start + candidate.duration - maxFragLookUpTolerance <= bufferEnd) {
             return 1;
-          } else if (candidate.start - maxFragLookUpTolerance > bufferEnd) {
-            return -1;
-          }
+          } // if maxFragLookUpTolerance will have negative value then don't return -1 for first element
+          else if (candidate.start - maxFragLookUpTolerance > bufferEnd && candidate.start) {
+              return -1;
+            }
           return 0;
         });
       } else {
@@ -2901,7 +2958,7 @@ var StreamController = function (_EventHandler) {
         var previousState = this.state;
         this._state = nextState;
         _logger.logger.log('engine state transition from ' + previousState + ' to ' + nextState);
-        this.hls.trigger(State.STREAM_STATE_TRANSITION, { previousState: previousState, nextState: nextState });
+        this.hls.trigger(_events2.default.STREAM_STATE_TRANSITION, { previousState: previousState, nextState: nextState });
       }
     },
     get: function get() {
@@ -7001,9 +7058,10 @@ var PlaylistLoader = function (_EventHandler) {
           result,
           regexp,
           byteRangeEndOffset,
-          byteRangeStartOffset;
+          byteRangeStartOffset,
+          tagList = [];
 
-      regexp = /(?:#EXT-X-(MEDIA-SEQUENCE):(\d+))|(?:#EXT-X-(TARGETDURATION):(\d+))|(?:#EXT-X-(KEY):(.*)[\r\n]+([^#|\r\n]+)?)|(?:#EXT(INF):([\d\.]+)[^\r\n]*([\r\n]+[^#|\r\n]+)?)|(?:#EXT-X-(BYTERANGE):([\d]+[@[\d]*)]*[\r\n]+([^#|\r\n]+)?|(?:#EXT-X-(ENDLIST))|(?:#EXT-X-(DIS)CONTINUITY))|(?:#EXT-X-(PROGRAM-DATE-TIME):(.*))/g;
+      regexp = /(?:#EXT-X-(MEDIA-SEQUENCE):(\d+))|(?:#EXT-X-(TARGETDURATION):(\d+))|(?:#EXT-X-(KEY):(.*)[\r\n]+([^#|\r\n]+)?)|(?:#EXT(INF):([\d\.]+)[^\r\n]*([\r\n]+[^#|\r\n]+)?)|(?:#EXT-X-(BYTERANGE):([\d]+[@[\d]*)]*[\r\n]+([^#|\r\n]+)?|(?:#EXT-X-(ENDLIST))|(?:#EXT-X-(DIS)CONTINUITY))|(?:#EXT-X-(PROGRAM-DATE-TIME):(.*))|(?:#EXT-X-(VERSION):(.*))|(?:#(.*):(.*))|(?:#(.*))/g;
       while ((result = regexp.exec(string)) !== null) {
         result.shift();
         result = result.filter(function (n) {
@@ -7016,11 +7074,16 @@ var PlaylistLoader = function (_EventHandler) {
           case 'TARGETDURATION':
             level.targetduration = parseFloat(result[1]);
             break;
+          case 'VERSION':
+            break;
+          case 'EXTM3U':
+            break;
           case 'ENDLIST':
             level.live = false;
             break;
           case 'DIS':
             cc++;
+            tagList.push(result);
             break;
           case 'BYTERANGE':
             var params = result[1].split('@');
@@ -7034,6 +7097,7 @@ var PlaylistLoader = function (_EventHandler) {
               frag.byteRangeStartOffset = byteRangeStartOffset;
               frag.byteRangeEndOffset = byteRangeEndOffset;
               frag.url = this.resolve(result[2], baseurl);
+              tagList.push(result);
             }
             break;
           case 'INF':
@@ -7042,11 +7106,13 @@ var PlaylistLoader = function (_EventHandler) {
               var sn = currentSN++;
               fragdecryptdata = this.fragmentDecryptdataFromLevelkey(levelkey, sn);
               var url = result[2] ? this.resolve(result[2], baseurl) : null;
-              frag = { url: url, duration: duration, start: totalduration, sn: sn, level: id, cc: cc, byteRangeStartOffset: byteRangeStartOffset, byteRangeEndOffset: byteRangeEndOffset, decryptdata: fragdecryptdata, programDateTime: programDateTime };
+              tagList.push(result);
+              frag = { url: url, duration: duration, start: totalduration, sn: sn, level: id, cc: cc, byteRangeStartOffset: byteRangeStartOffset, byteRangeEndOffset: byteRangeEndOffset, decryptdata: fragdecryptdata, programDateTime: programDateTime, tagList: tagList };
               level.fragments.push(frag);
               totalduration += duration;
               byteRangeStartOffset = null;
               programDateTime = null;
+              tagList = [];
             }
             break;
           case 'KEY':
@@ -7075,12 +7141,15 @@ var PlaylistLoader = function (_EventHandler) {
               //we have not moved onto another segment, we are still parsing one
               fragdecryptdata = this.fragmentDecryptdataFromLevelkey(levelkey, currentSN - 1);
               frag.decryptdata = fragdecryptdata;
+              tagList.push(result);
             }
             break;
           case 'PROGRAM-DATE-TIME':
             programDateTime = new Date(Date.parse(result[1]));
+            tagList.push(result);
             break;
           default:
+            tagList.push(result);
             break;
         }
       }
